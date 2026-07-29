@@ -48,6 +48,13 @@
   Inspect and report planned work without changing hosts, firewall, services,
   registry, or files. DryRun never claims that planned blocks are active.
 
+.PARAMETER HostNatSafe
+  Scope the wlidsvc DeviceAdd firewall deny to the mint host IPs instead of
+  all remote addresses. Keeps the hosts sinkhole and an IP-scoped service deny
+  (so the mint stays blocked at two layers) while no longer matching
+  NAT-forwarded traffic from Hyper-V / ICS guests. Use on a host that shares
+  its connection to VMs. Default protection is unchanged without this switch.
+
 .PARAMETER Json
   Emit Status as JSON.
 
@@ -91,6 +98,8 @@ param(
 
   [switch]$DryRun,
 
+  [switch]$HostNatSafe,
+
   [Parameter(DontShow = $true)]
   [switch]$InternalNoExit
 )
@@ -107,6 +116,7 @@ $script:StagingMintServiceRuleName = 'degdid-stage-wlidsvc-v2'
 $script:StagingMintServiceRuleDisplayName = 'degdid-stage-wlidsvc-v2'
 $script:FirewallGroup = 'degdid managed registration blocks'
 $script:MintHost = 'login.live.com'
+$script:HostNatSafeMode = $false
 $script:SettleSeconds = 12
 $script:DegdidExitCode = 0
 $script:Windows10SupportedBuild = 19045
@@ -1190,21 +1200,58 @@ function Remove-StagingMintServiceRule {
   }
 }
 
+function Get-MintScopeAddress {
+  # Real DeviceAdd mint-host IPs, resolved past the hosts sinkhole. Used to
+  # scope the wlidsvc deny under HostNatSafe so it blocks the mint without
+  # matching NAT-forwarded VM traffic. Returns empty when offline or
+  # unresolvable, in which case callers keep the all-remote fail-closed deny.
+  $addresses = New-Object System.Collections.Generic.List[string]
+  foreach ($recordType in @('A', 'AAAA')) {
+    try {
+      $answers = @(
+        Resolve-DnsName `
+          -Name $script:MintHost `
+          -Type $recordType `
+          -DnsOnly `
+          -NoHostsFile `
+          -QuickTimeout `
+          -ErrorAction Stop |
+          Where-Object { $_.IPAddress } |
+          ForEach-Object { $_.IPAddress }
+      )
+      foreach ($answer in $answers) {
+        if ($answer) { [void]$addresses.Add($answer) }
+      }
+    } catch {
+      # Unresolvable record type; caller falls back to the all-remote deny.
+    }
+  }
+  return @($addresses | Select-Object -Unique)
+}
+
 function New-StagingMintServiceRule {
   Remove-StagingMintServiceRule
-  New-NetFirewallRule `
-    -Name $script:StagingMintServiceRuleName `
-    -DisplayName $script:StagingMintServiceRuleDisplayName `
-    -Group $script:FirewallGroup `
-    -Description 'degdid temporary fail-closed wlidsvc deny during refresh' `
-    -Direction Outbound `
-    -Action Block `
-    -Enabled True `
-    -Profile Any `
-    -Protocol Any `
-    -Program (Join-Path $env:SystemRoot 'System32\svchost.exe') `
-    -Service 'wlidsvc' `
-    -ErrorAction Stop | Out-Null
+  $stagingRule = @{
+    Name = $script:StagingMintServiceRuleName
+    DisplayName = $script:StagingMintServiceRuleDisplayName
+    Group = $script:FirewallGroup
+    Description = 'degdid temporary fail-closed wlidsvc deny during refresh'
+    Direction = 'Outbound'
+    Action = 'Block'
+    Enabled = 'True'
+    Profile = 'Any'
+    Protocol = 'Any'
+    Program = (Join-Path $env:SystemRoot 'System32\svchost.exe')
+    Service = 'wlidsvc'
+    ErrorAction = 'Stop'
+  }
+  if ($script:HostNatSafeMode) {
+    $mintScope = @(Get-MintScopeAddress)
+    if ($mintScope.Count -gt 0) {
+      $stagingRule['RemoteAddress'] = $mintScope
+    }
+  }
+  New-NetFirewallRule @stagingRule | Out-Null
 }
 
 function Test-StagingMintServiceRuleEnforced {
@@ -1316,7 +1363,12 @@ function Set-FirewallBlock {
 
   try {
     $existingState = Get-FirewallState
-    $preserveMintService = [bool]$existingState.MintServiceRuleValid
+    # HostNatSafe must always (re)create the scoped deny rather than
+    # preserve a possibly all-remote rule left by a prior default run.
+    $preserveMintService = (
+      -not $script:HostNatSafeMode -and
+      [bool]$existingState.MintServiceRuleValid
+    )
     Remove-StagingMintServiceRule
     Remove-ManagedFirewallRules `
       -PreserveMintServiceRule:$preserveMintService
@@ -1349,19 +1401,29 @@ function Set-FirewallBlock {
       -ErrorAction Stop | Out-Null
 
     if (-not $preserveMintService) {
-      New-NetFirewallRule `
-        -Name $script:MintServiceRuleName `
-        -DisplayName $script:MintServiceRuleDisplayName `
-        -Group $script:FirewallGroup `
-        -Description 'degdid blocks all wlidsvc outbound DeviceAdd traffic' `
-        -Direction Outbound `
-        -Action Block `
-        -Enabled True `
-        -Profile Any `
-        -Protocol Any `
-        -Program (Join-Path $env:SystemRoot 'System32\svchost.exe') `
-        -Service 'wlidsvc' `
-        -ErrorAction Stop | Out-Null
+      $mintServiceRule = @{
+        Name = $script:MintServiceRuleName
+        DisplayName = $script:MintServiceRuleDisplayName
+        Group = $script:FirewallGroup
+        Description = 'degdid blocks all wlidsvc outbound DeviceAdd traffic'
+        Direction = 'Outbound'
+        Action = 'Block'
+        Enabled = 'True'
+        Profile = 'Any'
+        Protocol = 'Any'
+        Program = (Join-Path $env:SystemRoot 'System32\svchost.exe')
+        Service = 'wlidsvc'
+        ErrorAction = 'Stop'
+      }
+      if ($script:HostNatSafeMode) {
+        $mintScope = @(Get-MintScopeAddress)
+        if ($mintScope.Count -gt 0) {
+          $mintServiceRule['RemoteAddress'] = $mintScope
+          $mintServiceRule['Description'] =
+            'degdid blocks wlidsvc outbound to the DeviceAdd mint host (HostNatSafe scope)'
+        }
+      }
+      New-NetFirewallRule @mintServiceRule | Out-Null
     }
 
     # Hosts entries intentionally suppress normal DNS. Generate explicit
@@ -4595,6 +4657,7 @@ function Write-MutationResult {
 }
 
 function Invoke-DegdidMain {
+  $script:HostNatSafeMode = [bool]$HostNatSafe
   if (-not ($Status -or $Wipe -or $Decoy -or $Block -or $Unblock -or $Protect)) {
     $script:Status = $true
   }

@@ -2909,6 +2909,20 @@ function Get-GdidInventory {
   }
 }
 
+function Select-BlockingServiceError {
+  # A named identity service that is simply absent on this build is benign
+  # (NoServiceFoundForGivenName): there is nothing to quiesce, so it is skipped.
+  # Any other query failure - e.g. a present service whose ACL denies status
+  # access - is blocking and must fail the snapshot closed so the wipe never
+  # proceeds while one of these might still be running.
+  param([AllowNull()][object[]]$ServiceErrors)
+
+  return @(
+    $ServiceErrors |
+      Where-Object { $_.FullyQualifiedErrorId -notlike 'NoServiceFoundForGivenName*' }
+  )
+}
+
 function Get-GdidServiceSnapshot {
   $wanted = @('wlidsvc', 'CDPSvc', 'TokenBroker', 'CDPUserSvc*')
   try {
@@ -2916,14 +2930,7 @@ function Get-GdidServiceSnapshot {
       Get-Service -Name $wanted -ErrorAction SilentlyContinue -ErrorVariable serviceErrors |
         Sort-Object Name
     )
-    # A named identity service that is simply absent on this build is benign: there
-    # is nothing to quiesce, so skip it. Any other query failure - e.g. a present
-    # service whose ACL denies status access - must fail closed: the wipe cannot
-    # proceed while one of these might still be running.
-    $blocking = @(
-      $serviceErrors |
-        Where-Object { $_.FullyQualifiedErrorId -notlike 'NoServiceFoundForGivenName*' }
-    )
+    $blocking = @(Select-BlockingServiceError -ServiceErrors $serviceErrors)
     if ($blocking.Count -gt 0) {
       throw 'Identity services could not be queried: {0}' -f (
         ($blocking | ForEach-Object { $_.Exception.Message }) -join '; '

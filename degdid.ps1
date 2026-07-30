@@ -1200,11 +1200,32 @@ function Remove-StagingMintServiceRule {
   }
 }
 
+function Test-RoutableMintAddress {
+  param([AllowNull()][string]$Address)
+
+  # A resolver-level sinkhole (router / Pi-hole / NextDNS) answers login.live.com
+  # with 0.0.0.0, ::, or a loopback address even when -NoHostsFile bypasses the
+  # local hosts file. Treat those as "not a real mint IP" so the scope never
+  # pins the deny to a non-routable address.
+  $parsed = $null
+  if (-not [System.Net.IPAddress]::TryParse($Address, [ref]$parsed)) {
+    return $false
+  }
+  if ([System.Net.IPAddress]::IsLoopback($parsed)) {
+    return $false
+  }
+  return (@($parsed.GetAddressBytes() | Where-Object { $_ -ne 0 }).Count -gt 0)
+}
+
 function Get-MintScopeAddress {
   # Real DeviceAdd mint-host IPs, resolved past the hosts sinkhole. Used to
   # scope the wlidsvc deny under HostNatSafe so it blocks the mint without
-  # matching NAT-forwarded VM traffic. Returns empty when offline or
-  # unresolvable, in which case callers keep the all-remote fail-closed deny.
+  # matching NAT-forwarded VM traffic. Unspecified (0.0.0.0 / ::) and loopback
+  # answers - what a resolver-level sinkhole hands back - are dropped so the
+  # scope is never pinned to a non-routable address; the set then stays empty
+  # and callers keep the all-remote fail-closed deny. The scope is a
+  # point-in-time snapshot, only as current as this resolve. Returns empty when
+  # offline or unresolvable.
   $addresses = New-Object System.Collections.Generic.List[string]
   foreach ($recordType in @('A', 'AAAA')) {
     try {
@@ -1220,7 +1241,9 @@ function Get-MintScopeAddress {
           ForEach-Object { $_.IPAddress }
       )
       foreach ($answer in $answers) {
-        if ($answer) { [void]$addresses.Add($answer) }
+        if (Test-RoutableMintAddress -Address $answer) {
+          [void]$addresses.Add($answer)
+        }
       }
     } catch {
       # Unresolvable record type; caller falls back to the all-remote deny.

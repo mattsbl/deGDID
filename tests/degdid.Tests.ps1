@@ -990,3 +990,33 @@ Describe 'degdid Unblock sequencing' {
     Assert-MockCalled Invoke-DnsFlush 0 -Scope It
   }
 }
+
+Describe 'degdid mint scope address hygiene' {
+  It 'accepts routable IPv4 and IPv6 answers' {
+    (Test-RoutableMintAddress -Address '40.126.31.1') | Should Be $true
+    (Test-RoutableMintAddress -Address '2620:1ec:4::1') | Should Be $true
+  }
+
+  It 'rejects unspecified, loopback, and unparseable answers' {
+    (Test-RoutableMintAddress -Address '0.0.0.0') | Should Be $false
+    (Test-RoutableMintAddress -Address '::') | Should Be $false
+    (Test-RoutableMintAddress -Address '127.0.0.1') | Should Be $false
+    (Test-RoutableMintAddress -Address '::1') | Should Be $false
+    (Test-RoutableMintAddress -Address 'not-an-ip') | Should Be $false
+    (Test-RoutableMintAddress -Address $null) | Should Be $false
+  }
+
+  It 'drops sinkhole answers from the resolved mint scope' {
+    Mock Resolve-DnsName {
+      @(
+        [pscustomobject]@{ IPAddress = '40.126.31.1' }
+        [pscustomobject]@{ IPAddress = '0.0.0.0' }
+        [pscustomobject]@{ IPAddress = '127.0.0.1' }
+      )
+    }
+    $scope = @(Get-MintScopeAddress)
+    ($scope -contains '40.126.31.1') | Should Be $true
+    ($scope -contains '0.0.0.0') | Should Be $false
+    ($scope -contains '127.0.0.1') | Should Be $false
+  }
+}

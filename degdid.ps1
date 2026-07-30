@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
   Inspect, block, wipe, decoy, or unblock Microsoft GDID state on a supported
